@@ -10,6 +10,7 @@ import (
 
 	"github.com/qmuntal/gltf"
 	"github.com/xypwn/filediver/extractor/blend_helper"
+	"github.com/xypwn/filediver/extractor/fbx_helper"
 	"github.com/xypwn/filediver/stingray"
 )
 
@@ -237,6 +238,20 @@ func SaveDocument(ctx *Context, doc *gltf.Document, stingrayFormat, fileFormat s
 		}
 		err = blend_helper.ExportBlend(doc, outPath, ctx.Runner())
 		if err != nil {
+			return err
+		}
+	} else if fileFormat == "fbx" {
+		outPath, err := ctx.AllocateFile(fmt.Sprintf(".%v.fbx", stingrayFormat))
+		if err != nil {
+			return err
+		}
+		// FILEDIVER_SPLIT_ANIMATION_FBX=1 writes one FBX per animation take into a
+		// sibling named_fbx/ directory (useful for engines that prefer per-clip files).
+		if os.Getenv("FILEDIVER_SPLIT_ANIMATION_FBX") != "" {
+			if err := fbx_helper.ExportSplitAnimations(doc, outPath); err != nil {
+				return err
+			}
+		} else if err := fbx_helper.Export(doc, outPath); err != nil {
 			return err
 		}
 	}
