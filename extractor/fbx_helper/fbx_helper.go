@@ -1138,6 +1138,18 @@ func (e *exporter) readPrimitive(prim *gltf.Primitive) (primitiveData, error) {
 	if err != nil {
 		return out, err
 	}
+	// Vertices are stored in BIND space and do NOT pass through exportGlobalMatrix, so the
+	// optional scale bake (FILEDIVER_FBX_BAKE_SCALE) must be applied to them directly to keep
+	// mesh and skeleton consistent. Note: only scale is baked here, NOT yaw180 — under the
+	// scale1root workflow the yaw180 lives solely on bone0 (the export-root node Unreal
+	// absorbs), and at render time Unreal re-applies bone0's rotation to these bind-space
+	// vertices. Baking yaw180 into the vertices too would rotate the mesh twice. (Default
+	// bakeScale=1 -> this loop is a no-op and vertices are exported faithfully.)
+	if bakeScale != 1.0 {
+		for i := range positions {
+			positions[i] = mgl32.Vec3{positions[i][0] * bakeScale, positions[i][1] * bakeScale, positions[i][2] * bakeScale}
+		}
+	}
 	out.positions = positions
 	if normalIdx, ok := prim.Attributes[gltf.NORMAL]; ok {
 		out.normals, _ = e.readVec3Accessor(normalIdx)
@@ -1427,11 +1439,60 @@ func (e *exporter) globalMatrix(idx uint32) mgl32.Mat4 {
 }
 
 func (e *exporter) exportGlobalMatrix(idx uint32) mgl32.Mat4 {
-	return ueForwardCorrectionMatrix().Mul4(e.globalMatrix(idx))
+	g := ueForwardCorrectionMatrix().Mul4(e.globalMatrix(idx))
+	// Optional bake of import-time transforms into the FBX data itself, controlled by
+	// env vars (default OFF = faithful coordinates). Motivation: Unreal's root motion
+	// is extracted only from the root bone (bone0) and requires it to have a CLEAN TRS
+	// (scale=1, no rotation). If you import with import-scale=100 and yaw=180, Unreal
+	// bakes that scale/yaw onto bone0, leaving it un-clean and breaking root motion.
+	// Baking those transforms here instead lets you import at scale=1 / rotation=0, so
+	// bone0 stays clean. Engine-specific (Unreal "scale1root" workflow), hence opt-in.
+	//   FILEDIVER_FBX_BAKE_SCALE=100   -> multiply the translation column by 100 (m -> cm)
+	//   FILEDIVER_FBX_BAKE_YAW180=1    -> left-multiply Ry180 (about FBX Y-up) into the frame
+	// The Ry180 cancels under the local = parent^-1 * child reduction for child bones (it
+	// lands on the export-root node, which Unreal absorbs into bone0). Scale is applied to
+	// the translation column only, so each bone keeps scale=1 (the root-clean requirement).
+	if bakeYaw180 {
+		g = ry180Matrix().Mul4(g)
+	}
+	if bakeScale != 1.0 {
+		g[12] *= bakeScale
+		g[13] *= bakeScale
+		g[14] *= bakeScale
+	}
+	return g
+}
+
+// bakeScale / bakeYaw180 are read once from the environment (see exportGlobalMatrix).
+// Default: bakeScale=1, bakeYaw180=false -> coordinates are exported faithfully.
+var bakeScale = readBakeScale()
+var bakeYaw180 = os.Getenv("FILEDIVER_FBX_BAKE_YAW180") != ""
+
+func readBakeScale() float32 {
+	s := os.Getenv("FILEDIVER_FBX_BAKE_SCALE")
+	if s == "" {
+		return 1.0
+	}
+	var v float64
+	if _, err := fmt.Sscanf(s, "%g", &v); err != nil || v == 0 {
+		return 1.0
+	}
+	return float32(v)
 }
 
 func ueForwardCorrectionMatrix() mgl32.Mat4 {
 	return mgl32.Ident4()
+}
+
+// ry180Matrix is a 180-degree rotation about the FBX Y-up axis: diag(-1, 1, -1, 1) in
+// column-major mgl32 layout (negates X and Z, keeps Y). Pure rotation (det=+1).
+func ry180Matrix() mgl32.Mat4 {
+	return mgl32.Mat4{
+		-1, 0, 0, 0,
+		0, 1, 0, 0,
+		0, 0, -1, 0,
+		0, 0, 0, 1,
+	}
 }
 
 func matrixToTRS(m mgl32.Mat4) (mgl32.Vec3, mgl32.Vec3, mgl32.Vec3) {
