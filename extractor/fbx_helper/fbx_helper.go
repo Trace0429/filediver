@@ -387,6 +387,19 @@ func (e *exporter) collectMeshObjects() []meshObject {
 		if name == "" {
 			name = fmt.Sprintf("Mesh_%d", meshIndex)
 		}
+		// trace: under FILEDIVER_FBX_ONLY_LOD=N, strip the "_LODN" suffix from the
+		// single exported LOD mesh so every per-level FBX names its primary mesh by
+		// the same base (e.g. "g_flashhider" for L0..Ln). Unreal picks the LOD root
+		// bone from the mesh node name; if level files disagree (g_flashhider vs
+		// g_flashhider_LOD1) import_lod rejects the LOD with a root-bone mismatch.
+		// Normalizing to the base name keeps the root bone consistent across levels.
+		if onlyLODStr := os.Getenv("FILEDIVER_FBX_ONLY_LOD"); onlyLODStr != "" {
+			if base, level := lodBaseAndLevel(name); level > 0 {
+				if onlyLOD, perr := strconv.Atoi(onlyLODStr); perr == nil && level == onlyLOD {
+					name = base
+				}
+			}
+		}
 		meshObjects = append(meshObjects, meshObject{
 			nodeIndex: uint32(nodeIndex),
 			meshIndex: meshIndex,
