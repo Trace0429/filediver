@@ -6,7 +6,10 @@ import (
 	"io"
 	"maps"
 	"math"
+	"os"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/qmuntal/gltf"
@@ -20,6 +23,24 @@ import (
 	"github.com/xypwn/filediver/stingray"
 	"github.com/xypwn/filediver/stingray/unit"
 )
+
+// trace: matches a trailing "_LOD<n>" suffix (mirrors fbx_helper.lodSuffixRe).
+var geoLodSuffixRe = regexp.MustCompile(`(?i)_LOD(\d+)$`)
+
+// trace: lodBaseAndLevelGeo returns the base name and LOD level for a mesh group
+// name. A name without an "_LOD<n>" suffix is level 0 (the base / LOD0 mesh).
+// Used by the FILEDIVER_FBX_ONLY_LOD single-level export path.
+func lodBaseAndLevelGeo(name string) (string, int) {
+	m := geoLodSuffixRe.FindStringSubmatch(name)
+	if m == nil {
+		return name, 0
+	}
+	level, err := strconv.Atoi(m[1])
+	if err != nil {
+		return name, 0
+	}
+	return name[:len(name)-len(m[0])], level
+}
 
 type MeshInfo struct {
 	Groups          []unit.MeshGroup
@@ -962,6 +983,25 @@ func LoadGLTF(ctx *extractor.Context, gpuR io.ReadSeeker, doc *gltf.Document, me
 			}
 			if !cfg.Model.IncludeLODS && ((hasLOD0 && strings.Contains(groupName, "_LOD") && !strings.Contains(groupName, "_LOD0")) || (hasBaseModel && strings.Contains(groupName, "_LOD0")) || strings.Contains(groupName, "shadow")) {
 				continue
+			}
+		}
+
+		// trace: FILEDIVER_FBX_ONLY_LOD=N exports ONLY the mesh group for that single
+		// LOD level, so each level can be written to its own FBX and re-assembled in
+		// Unreal via import_lod(). This sidesteps the UDIM-vs-LodGroup level mixup
+		// where UDIM sections of the LOD0 mesh got mis-counted as separate LOD levels.
+		// N=0 means LOD0 content (the non-_LOD / UDIM mesh, plus an explicit _LOD0 if
+		// present); N>=1 means the matching g_*_LODN group only. Shadow/cull/collision
+		// always excluded here.
+		if onlyLODStr := os.Getenv("FILEDIVER_FBX_ONLY_LOD"); onlyLODStr != "" {
+			if onlyLOD, perr := strconv.Atoi(onlyLODStr); perr == nil {
+				if strings.Contains(groupName, "shadow") || strings.Contains(groupName, "cull") || strings.Contains(groupName, "collision") || strings.Contains(groupName, "_proxy") {
+					continue
+				}
+				_, level := lodBaseAndLevelGeo(groupName)
+				if level != onlyLOD {
+					continue
+				}
 			}
 		}
 

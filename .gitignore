@@ -8,4 +8,5 @@ cpu.prof
 filediver-gui-windows.exe
 filediver-gui.exe
 filediver-cli.exe
+filediver-cli-*.exe
 /rsrc_windows_*.syso

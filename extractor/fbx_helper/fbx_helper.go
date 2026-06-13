@@ -8,7 +8,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/go-gl/mathgl/mgl32"
@@ -31,6 +33,19 @@ type exporter struct {
 	clusters          []cluster
 	conns             []connection
 	takes             []fbxTake
+	lodGroups         []lodGroup
+	lodGroupByNode    map[uint32]int // mesh nodeIndex -> index into lodGroups
+}
+
+// lodGroup represents a set of LOD sibling meshes (e.g. g_body, g_body_LOD1..N)
+// that should be exported under a single FBX LodGroup node so Unreal recognizes
+// them as one mesh with multiple LOD levels.
+type lodGroup struct {
+	base     string       // shared base name (e.g. "g_body")
+	members  []meshObject // sorted by LOD level, members[0] == LOD0
+	attrID   int64        // LodGroup NodeAttribute id
+	modelID  int64        // LodGroup Null Model id (container)
+	parentID int64        // FBX id the LodGroup Model attaches to (root=0 or a node)
 }
 
 type connection struct {
@@ -67,7 +82,10 @@ type meshObject struct {
 type primitiveData struct {
 	positions []mgl32.Vec3
 	normals   []mgl32.Vec3
-	uvs       []mgl32.Vec2
+	// trace: multi-UV export (TEXCOORD_0..3). Elite-family body meshes carry the
+	// primary material UV in set 3 (set 0 is the tiled detail UV), so exporting
+	// only TEXCOORD_0 broke body texture mapping in UE.
+	uvSets    [4][]mgl32.Vec2
 	joints    [][4]uint32
 	weights   [][4]float32
 	indices   []int
@@ -102,6 +120,7 @@ func Export(doc *gltf.Document, outPath string) error {
 		exportJoints:      make(map[uint32]bool),
 		exportModels:      make(map[uint32]bool),
 		meshClusterCounts: make(map[uint32]int),
+		lodGroupByNode:    make(map[uint32]int),
 	}
 	return e.export()
 }
@@ -176,6 +195,7 @@ func (e *exporter) export() error {
 	if err := e.prepareExportSets(meshObjects); err != nil {
 		return err
 	}
+	e.detectLODGroups(meshObjects)
 
 	e.writeHeader()
 	e.writeDefinitions(meshObjects)
@@ -251,11 +271,14 @@ func (e *exporter) writeHeader() {
 }
 
 func (e *exporter) writeDefinitions(meshObjects []meshObject) {
-	modelCount := len(e.exportModels)
+	// Each LOD group adds one Null Model (the LodGroup container) and one
+	// LodGroup NodeAttribute to the object counts.
+	lodGroupCount := len(e.lodGroups)
+	modelCount := len(e.exportModels) + lodGroupCount
 	geometryCount := len(meshObjects)
 	materialCount := len(e.doc.Materials)
 	animStacks, animLayers, animCurveNodes, animCurves := e.animationDefinitionCounts()
-	nodeAttributeCount := 0
+	nodeAttributeCount := lodGroupCount
 	for i := range e.doc.Nodes {
 		if e.shouldExportJoint(uint32(i)) {
 			nodeAttributeCount++
@@ -332,6 +355,9 @@ func (e *exporter) writeObjects(meshObjects []meshObject) error {
 		}
 		e.writeModel(uint32(i))
 	}
+	for _, lg := range e.lodGroups {
+		e.writeLODGroup(lg)
+	}
 	for _, obj := range meshObjects {
 		if err := e.writeMeshGeometry(obj); err != nil {
 			return err
@@ -370,6 +396,113 @@ func (e *exporter) collectMeshObjects() []meshObject {
 		})
 	}
 	return meshObjects
+}
+
+// lodSuffixRe matches a trailing "_LOD<n>" suffix (case-insensitive), e.g.
+// "g_body_LOD3". The capture group holds the numeric LOD level.
+var lodSuffixRe = regexp.MustCompile(`(?i)_LOD(\d+)$`)
+
+// lodBaseAndLevel splits a mesh name into its LOD base name and LOD level.
+// "g_body"        -> ("g_body", 0)
+// "g_body_LOD3"   -> ("g_body", 3)
+// The base of a "_LODn" name is the name with the suffix removed, so
+// "g_body" and "g_body_LOD1..N" share base "g_body", while "g_body_shadow"
+// (no _LODn suffix) is its own base and never merges with "g_body".
+func lodBaseAndLevel(name string) (string, int) {
+	m := lodSuffixRe.FindStringSubmatch(name)
+	if m == nil {
+		return name, 0
+	}
+	level, err := strconv.Atoi(m[1])
+	if err != nil {
+		return name, 0
+	}
+	return name[:len(name)-len(m[0])], level
+}
+
+// detectLODGroups scans the mesh objects, groups same-base LOD siblings
+// (g_body + g_body_LOD1..N) and, for every group that forms a real LOD chain,
+// allocates a FBX LodGroup (NodeAttribute + Null Model). Meshes without LOD
+// siblings are left untouched so single-mesh / non-LOD models export exactly as
+// before. Detection is opt-out via FILEDIVER_FBX_NO_LODGROUP.
+func (e *exporter) detectLODGroups(meshObjects []meshObject) {
+	if os.Getenv("FILEDIVER_FBX_NO_LODGROUP") != "" {
+		return
+	}
+
+	type group struct {
+		base    string
+		members []meshObject
+		levels  []int
+	}
+	order := make([]string, 0)
+	byBase := make(map[string]*group)
+	for _, obj := range meshObjects {
+		base, level := lodBaseAndLevel(obj.name)
+		g, ok := byBase[base]
+		if !ok {
+			g = &group{base: base}
+			byBase[base] = g
+			order = append(order, base)
+		}
+		g.members = append(g.members, obj)
+		g.levels = append(g.levels, level)
+	}
+
+	for _, base := range order {
+		g := byBase[base]
+		// Only form a LodGroup when there is a genuine multi-LOD chain:
+		// at least two members AND at least one "_LODn" sibling. A lone mesh
+		// (or a base name that merely coincides) keeps the original behavior.
+		if len(g.members) < 2 {
+			continue
+		}
+		hasLODSuffix := false
+		for _, lvl := range g.levels {
+			if lvl > 0 {
+				hasLODSuffix = true
+				break
+			}
+		}
+		if !hasLODSuffix {
+			continue
+		}
+
+		// Sort members by LOD level ascending (LOD0 first). FBX LodGroup uses
+		// child-connection order to assign LOD levels, so order matters.
+		idxOrder := make([]int, len(g.members))
+		for i := range idxOrder {
+			idxOrder[i] = i
+		}
+		sort.SliceStable(idxOrder, func(a, b int) bool {
+			return g.levels[idxOrder[a]] < g.levels[idxOrder[b]]
+		})
+		sortedMembers := make([]meshObject, len(g.members))
+		for i, oi := range idxOrder {
+			sortedMembers[i] = g.members[oi]
+		}
+
+		lg := lodGroup{
+			base:    base,
+			members: sortedMembers,
+			attrID:  e.newID(),
+			modelID: e.newID(),
+		}
+		// The LodGroup Model takes the place of the LOD0 mesh's original parent
+		// in the hierarchy (root or a skeleton/scene node). All siblings share
+		// the same parent in practice; derive it from LOD0.
+		if parent, ok := e.exportParent(sortedMembers[0].nodeIndex); ok {
+			lg.parentID = e.idForNode(parent)
+		} else {
+			lg.parentID = 0 // root
+		}
+
+		gi := len(e.lodGroups)
+		e.lodGroups = append(e.lodGroups, lg)
+		for _, m := range sortedMembers {
+			e.lodGroupByNode[m.nodeIndex] = gi
+		}
+	}
 }
 
 func (e *exporter) prepareExportSets(meshObjects []meshObject) error {
@@ -479,6 +612,43 @@ func (e *exporter) writeNodeAttribute(idx uint32) {
 	fmt.Fprintln(e.w, "\t}")
 }
 
+// writeLODGroup emits the FBX LodGroup NodeAttribute and its container Null
+// Model for a detected LOD chain. The actual parent/child connections (the LOD
+// meshes re-parented under the group, the group attached to root/skeleton, and
+// the NodeAttribute attached to the group Model) are emitted in writeConnections.
+//
+// Thresholds: we set only Display flags (all LODs visible) and leave the per-LOD
+// switch distances at their FBX defaults. Unreal computes / lets the user adjust
+// LOD screen sizes on import, so encoding the game's exact switch distances here
+// is unnecessary; the load-bearing part is the LodGroup structure + child order.
+func (e *exporter) writeLODGroup(lg lodGroup) {
+	name := lg.base
+	if name == "" {
+		name = "LODGroup"
+	}
+	fmt.Fprintf(e.w, "\tNodeAttribute: %d, \"NodeAttribute::%s\", \"LodGroup\" {\n", lg.attrID, escape(name))
+	fmt.Fprintln(e.w, "\t\tProperties70:  {")
+	fmt.Fprintln(e.w, "\t\t\tP: \"WorldSpace\", \"bool\", \"\", \"\",0")
+	fmt.Fprintln(e.w, "\t\t\tP: \"MinMaxDistance\", \"bool\", \"\", \"\",0")
+	// One Display flag per LOD level keeps every level switchable in DCC tools.
+	for range lg.members {
+		fmt.Fprintln(e.w, "\t\t\tP: \"Display\", \"Visibility\", \"\", \"A\",1")
+	}
+	fmt.Fprintln(e.w, "\t\t}")
+	fmt.Fprintln(e.w, "\t}")
+
+	fmt.Fprintf(e.w, "\tModel: %d, \"Model::%s\", \"Null\" {\n", lg.modelID, escape(name))
+	fmt.Fprintln(e.w, "\t\tVersion: 232")
+	fmt.Fprintln(e.w, "\t\tProperties70:  {")
+	fmt.Fprintln(e.w, "\t\t\tP: \"RotationActive\", \"bool\", \"\", \"\",1")
+	fmt.Fprintln(e.w, "\t\t\tP: \"RotationOrder\", \"enum\", \"\", \"\",0")
+	fmt.Fprintln(e.w, "\t\t\tP: \"InheritType\", \"enum\", \"\", \"\",1")
+	fmt.Fprintln(e.w, "\t\t\tP: \"DefaultAttributeIndex\", \"int\", \"Integer\", \"\",0")
+	fmt.Fprintln(e.w, "\t\t}")
+	fmt.Fprintln(e.w, "\t\tShading: T")
+	fmt.Fprintln(e.w, "\t}")
+}
+
 func (e *exporter) writeModel(idx uint32) {
 	node := e.doc.Nodes[idx]
 	id := e.idForNode(idx)
@@ -530,14 +700,24 @@ func (e *exporter) writeMeshGeometry(obj meshObject) error {
 		writeFloatArray(e.w, "\t\t\tNormals", flattenVec3(merged.normals))
 		fmt.Fprintln(e.w, "\t\t}")
 	}
-	if len(merged.uvs) == len(merged.positions) {
-		fmt.Fprintln(e.w, "\t\tLayerElementUV: 0 {")
+	uvLayerCount := 0
+	for k := 0; k < 4; k++ {
+		uvs := merged.uvSets[k]
+		if len(uvs) == 0 {
+			continue
+		}
+		// pad: prims lacking this set leave a short array — fill zeros to vertex count
+		for len(uvs) < len(merged.positions) {
+			uvs = append(uvs, mgl32.Vec2{})
+		}
+		fmt.Fprintf(e.w, "\t\tLayerElementUV: %d {\n", uvLayerCount)
 		fmt.Fprintln(e.w, "\t\t\tVersion: 101")
-		fmt.Fprintln(e.w, "\t\t\tName: \"UVSet\"")
+		fmt.Fprintf(e.w, "\t\t\tName: \"UVSet%d\"\n", uvLayerCount)
 		fmt.Fprintln(e.w, "\t\t\tMappingInformationType: \"ByVertice\"")
 		fmt.Fprintln(e.w, "\t\t\tReferenceInformationType: \"Direct\"")
-		writeFloatArray(e.w, "\t\t\tUV", flattenVec2(merged.uvs))
+		writeFloatArray(e.w, "\t\t\tUV", flattenVec2(uvs))
 		fmt.Fprintln(e.w, "\t\t}")
+		uvLayerCount++
 	}
 	if len(materialSlots) > 0 {
 		fmt.Fprintln(e.w, "\t\tLayerElementMaterial: 0 {")
@@ -570,7 +750,7 @@ func (e *exporter) writeMeshGeometry(obj meshObject) error {
 		fmt.Fprintln(e.w, "\t\t\t\tTypedIndex: 0")
 		fmt.Fprintln(e.w, "\t\t\t}")
 	}
-	if len(merged.uvs) == len(merged.positions) {
+	if uvLayerCount > 0 {
 		fmt.Fprintln(e.w, "\t\t\tLayerElement:  {")
 		fmt.Fprintln(e.w, "\t\t\t\tType: \"LayerElementUV\"")
 		fmt.Fprintln(e.w, "\t\t\t\tTypedIndex: 0")
@@ -589,6 +769,17 @@ func (e *exporter) writeMeshGeometry(obj meshObject) error {
 		fmt.Fprintln(e.w, "\t\t\t}")
 	}
 	fmt.Fprintln(e.w, "\t\t}")
+	// trace: extra UV sets each need their own Layer block (FBX allows only one
+	// LayerElementUV per Layer). Layer 0 above holds UVSet0; emit Layer 1.. for the rest.
+	for li := 1; li < uvLayerCount; li++ {
+		fmt.Fprintf(e.w, "\t\tLayer: %d {\n", li)
+		fmt.Fprintln(e.w, "\t\t\tVersion: 100")
+		fmt.Fprintln(e.w, "\t\t\tLayerElement:  {")
+		fmt.Fprintln(e.w, "\t\t\t\tType: \"LayerElementUV\"")
+		fmt.Fprintf(e.w, "\t\t\t\tTypedIndex: %d\n", li)
+		fmt.Fprintln(e.w, "\t\t\t}")
+		fmt.Fprintln(e.w, "\t\t}")
+	}
 	fmt.Fprintln(e.w, "\t}")
 
 	e.conns = append(e.conns, connection{child: obj.meshID, parent: obj.nodeID})
@@ -744,6 +935,13 @@ func (e *exporter) writeConnections() {
 		if !e.shouldExportModel(idx) {
 			continue
 		}
+		// Mesh nodes that belong to a LOD group are re-parented under the
+		// LodGroup Model instead of root/skeleton. Those connections are
+		// emitted separately in strict LOD order (see below), so skip the
+		// default parent connection here.
+		if _, inLOD := e.lodGroupByNode[idx]; inLOD {
+			continue
+		}
 		if parent, ok := e.exportParent(idx); ok {
 			e.conns = append(e.conns, connection{child: e.idForNode(idx), parent: e.idForNode(parent)})
 		} else {
@@ -752,6 +950,14 @@ func (e *exporter) writeConnections() {
 		if e.shouldExportJoint(idx) {
 			e.conns = append(e.conns, connection{child: e.idForNodeAttribute(idx), parent: e.idForNode(idx)})
 		}
+	}
+
+	// LodGroup structural connections: attach each LodGroup Model to its parent
+	// (root or skeleton node) and its NodeAttribute to the Model. Order among
+	// these does not matter, so they go through the normal sort/dedup below.
+	for _, lg := range e.lodGroups {
+		e.conns = append(e.conns, connection{child: lg.modelID, parent: lg.parentID})
+		e.conns = append(e.conns, connection{child: lg.attrID, parent: lg.modelID})
 	}
 
 	sort.SliceStable(e.conns, func(i, j int) bool {
@@ -771,6 +977,21 @@ func (e *exporter) writeConnections() {
 		if c.prop != "" {
 			fmt.Fprintf(e.w, "\tC: \"OP\",%d,%d, \"%s\"\n", c.child, c.parent, escape(c.prop))
 		} else {
+			fmt.Fprintf(e.w, "\tC: \"OO\",%d,%d\n", c.child, c.parent)
+		}
+	}
+
+	// Re-parent each LOD mesh Model under its LodGroup Model in strict LOD order
+	// (LOD0 first). FBX assigns LOD levels by the order these child connections
+	// appear, so these are written deterministically here rather than through
+	// the id-keyed sort above.
+	for _, lg := range e.lodGroups {
+		for _, m := range lg.members {
+			c := connection{child: m.nodeID, parent: lg.modelID}
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
 			fmt.Fprintf(e.w, "\tC: \"OO\",%d,%d\n", c.child, c.parent)
 		}
 	}
@@ -1102,7 +1323,16 @@ func (e *exporter) mergeMesh(mesh *gltf.Mesh) (primitiveData, []int, error) {
 		base := uint32(len(out.positions))
 		out.positions = append(out.positions, pd.positions...)
 		out.normals = append(out.normals, pd.normals...)
-		out.uvs = append(out.uvs, pd.uvs...)
+		for k := 0; k < 4; k++ {
+			if len(pd.uvSets[k]) == 0 {
+				continue
+			}
+			// pad: prims earlier in the merge may lack this UV set
+			for uint32(len(out.uvSets[k])) < base {
+				out.uvSets[k] = append(out.uvSets[k], mgl32.Vec2{})
+			}
+			out.uvSets[k] = append(out.uvSets[k], pd.uvSets[k]...)
+		}
 		out.joints = append(out.joints, pd.joints...)
 		out.weights = append(out.weights, pd.weights...)
 		slot := 0
@@ -1154,8 +1384,19 @@ func (e *exporter) readPrimitive(prim *gltf.Primitive) (primitiveData, error) {
 	if normalIdx, ok := prim.Attributes[gltf.NORMAL]; ok {
 		out.normals, _ = e.readVec3Accessor(normalIdx)
 	}
-	if uvIdx, ok := prim.Attributes[gltf.TEXCOORD_0]; ok {
-		out.uvs, _ = e.readVec2Accessor(uvIdx)
+	for k := 0; k < 4; k++ {
+		attrName := gltf.TEXCOORD_0
+		switch k {
+		case 1:
+			attrName = "TEXCOORD_1"
+		case 2:
+			attrName = "TEXCOORD_2"
+		case 3:
+			attrName = "TEXCOORD_3"
+		}
+		if uvIdx, ok := prim.Attributes[attrName]; ok {
+			out.uvSets[k], _ = e.readVec2Accessor(uvIdx)
+		}
 	}
 	if jointIdx, ok := prim.Attributes[gltf.JOINTS_0]; ok {
 		out.joints, _ = e.readVec4UintAccessor(jointIdx)
