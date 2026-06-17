@@ -27,6 +27,51 @@ import (
 // trace: matches a trailing "_LOD<n>" suffix (mirrors fbx_helper.lodSuffixRe).
 var geoLodSuffixRe = regexp.MustCompile(`(?i)_LOD(\d+)$`)
 
+// trace: geoDestructionRe detects DESTRUCTION-FORM mesh groups (debris/rubble)
+// by their trailing token, NOT by a naive substring. A bare substring test
+// (strings.Contains(name,"debris")) mis-classifies UNITS whose own asset name
+// contains "debris"/"rubble" -- e.g. g_ruin_debris_straight_1m_01 and the ~50
+// g_generic_debris_* props -- and wrongly drops their game mesh under the
+// FILEDIVER_FBX_ONLY_LOD intact export (symptom: "document has no mesh nodes").
+// A real destruction node has debris/rubble as a TRAILING segment:
+//   debris  debris_02  rubble  c_rubble_01  rubble_collision
+//   g_ammo_box_01_debris  g_tool_rack_01_debris_03  g_debris_01 (a sub-node)
+// whereas a unit whose name merely contains the word keeps descriptive tokens
+// after it (g_ruin_debris_STRAIGHT_1m_01) so the suffix anchor does not match.
+var geoDestructionRe = regexp.MustCompile(`(?i)(^|_)(debris|rubble)(_collision)?(_\d+)?$`)
+
+// isDestructionFormGeo reports whether a mesh group name is a debris/rubble
+// destruction form (which overlaps the intact mesh and must be exported only
+// via FILEDIVER_FBX_ONLY_DEBRIS). The "_LOD<n>" suffix is stripped first so a
+// destruction node that itself carries LODs (g_x_debris_LOD1) is still caught.
+func isDestructionFormGeo(name string) bool {
+	base := geoLodSuffixRe.ReplaceAllString(name, "")
+	return geoDestructionRe.MatchString(base)
+}
+
+// trace: isCollisionFormGeo reports whether a mesh group is a PHYSICS-collision
+// proxy that should be exported on its own (FILEDIVER_FBX_ONLY_COLLISION) so it
+// can be re-imported as a StaticMesh collision body in Unreal.
+//
+// HD2 names the collision HULL geometry with a "c_" prefix (e.g.
+// c_whole_building) -- NOT a node literally called "collision" (that node is an
+// empty transform with no mesh). So we match the c_ prefix. We EXCLUDE:
+//   - c_navmesh / *navigation  -> navmesh, not physics collision (narrow scope)
+//   - rubble_collision / debris_collision (isDestructionFormGeo) -> debris line
+// Other proxy kinds (shadow / destruction_volume / cull / _proxy) are not c_
+// collision and stay dropped in the intact export.
+func isCollisionFormGeo(name string) bool {
+	if isDestructionFormGeo(name) {
+		return false // rubble_collision / debris_collision -> debris line
+	}
+	if strings.Contains(name, "navmesh") || strings.Contains(name, "navigation") {
+		return false // navmesh is not physics collision (narrow scope)
+	}
+	// c_ prefix is HD2's collision-hull convention (c_whole_building, c_<part>).
+	// Also keep a literal "_collision" segment for any unit that uses that form.
+	return strings.HasPrefix(name, "c_") || strings.Contains(name, "_collision")
+}
+
 // trace: lodBaseAndLevelGeo returns the base name and LOD level for a mesh group
 // name. A name without an "_LOD<n>" suffix is level 0 (the base / LOD0 mesh).
 // Used by the FILEDIVER_FBX_ONLY_LOD single-level export path.
@@ -991,16 +1036,47 @@ func LoadGLTF(ctx *extractor.Context, gpuR io.ReadSeeker, doc *gltf.Document, me
 		// Unreal via import_lod(). This sidesteps the UDIM-vs-LodGroup level mixup
 		// where UDIM sections of the LOD0 mesh got mis-counted as separate LOD levels.
 		// N=0 means LOD0 content (the non-_LOD / UDIM mesh, plus an explicit _LOD0 if
-		// present); N>=1 means the matching g_*_LODN group only. Shadow/cull/collision
-		// always excluded here.
+		// present); N>=1 means the matching g_*_LODN group only.
+		//
+		// The INTACT export drops proxy states (shadow/cull/collision/proxy/
+		// destruction/navigation) AND the破坏 states (debris/rubble), because those
+		// overlap the intact mesh at the same world position and would double up the
+		// geometry. The debris/rubble form is exported SEPARATELY via
+		// FILEDIVER_FBX_ONLY_DEBRIS=1, which inverts this filter to keep ONLY
+		// debris/rubble — so the破碎 model lands in its own *_debris FBX and nothing
+		// is thrown away.
 		if onlyLODStr := os.Getenv("FILEDIVER_FBX_ONLY_LOD"); onlyLODStr != "" {
 			if onlyLOD, perr := strconv.Atoi(onlyLODStr); perr == nil {
-				if strings.Contains(groupName, "shadow") || strings.Contains(groupName, "cull") || strings.Contains(groupName, "collision") || strings.Contains(groupName, "_proxy") {
-					continue
-				}
-				_, level := lodBaseAndLevelGeo(groupName)
-				if level != onlyLOD {
-					continue
+				// trace: precise destruction-form match (see isDestructionFormGeo).
+				// Was strings.Contains(groupName,"debris"/"rubble") which dropped the
+				// game mesh of units whose name contains the word (ruin_debris_*,
+				// generic_debris_*) -- now only true destruction nodes are matched.
+				isDebris := isDestructionFormGeo(groupName)
+				isProxy := strings.Contains(groupName, "shadow") || strings.Contains(groupName, "cull") ||
+					strings.Contains(groupName, "collision") || strings.Contains(groupName, "_proxy") ||
+					strings.Contains(groupName, "destruction") || strings.Contains(groupName, "navigation")
+				if os.Getenv("FILEDIVER_FBX_ONLY_COLLISION") != "" {
+					// collision-only export: keep ONLY the physics-collision proxy
+					// (collision / *_collision, NOT rubble_collision), drop all else.
+					// Lets the collision geo land in its own *_collision FBX to be
+					// re-imported as a StaticMesh collision body in Unreal.
+					if !isCollisionFormGeo(groupName) {
+						continue
+					}
+				} else if os.Getenv("FILEDIVER_FBX_ONLY_DEBRIS") != "" {
+					// debris-only export: keep ONLY debris/rubble, drop everything else.
+					if !isDebris {
+						continue
+					}
+				} else {
+					// intact export: drop proxies AND debris/rubble.
+					if isProxy || isDebris {
+						continue
+					}
+					_, level := lodBaseAndLevelGeo(groupName)
+					if level != onlyLOD {
+						continue
+					}
 				}
 			}
 		}
