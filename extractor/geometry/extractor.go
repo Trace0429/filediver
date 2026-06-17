@@ -72,6 +72,37 @@ func isCollisionFormGeo(name string) bool {
 	return strings.HasPrefix(name, "c_") || strings.Contains(name, "_collision")
 }
 
+// trace: geoVolumeRe matches HD2 LOD-distance / trigger VOLUME helper nodes
+// (v1, v3, v5, ...) — bare "v" + digits. These are not renderable geometry and
+// must be dropped from the intact export (they leaked into modular _master units
+// as empty material slots because they have no shadow/collision/LOD substring).
+var geoVolumeRe = regexp.MustCompile(`^v\d+$`)
+
+// trace: isProxyFormGeo reports whether a mesh group is ANY non-render proxy that
+// must be dropped from the intact (renderable) export. Superset of the old
+// inline check: adds the HD2 "c_" collision/navmesh prefix and the vN volume
+// helpers, which the bare substring test (Contains "collision"/"navigation")
+// missed for modular _master units — those leaked c_whole_building / c_navmesh /
+// v1 / v3 / v5 as empty material slots. Excludes debris/rubble (handled by
+// isDestructionFormGeo / FILEDIVER_FBX_ONLY_DEBRIS).
+func isProxyFormGeo(name string) bool {
+	if strings.Contains(name, "shadow") || strings.Contains(name, "cull") ||
+		strings.Contains(name, "collision") || strings.Contains(name, "_proxy") ||
+		strings.Contains(name, "destruction") || strings.Contains(name, "navigation") ||
+		strings.Contains(name, "navmesh") {
+		return true
+	}
+	// HD2 c_ prefix = collision hull / navmesh / other physics proxy.
+	if strings.HasPrefix(name, "c_") {
+		return true
+	}
+	// vN volume helpers (LOD-distance / trigger volumes).
+	if geoVolumeRe.MatchString(name) {
+		return true
+	}
+	return false
+}
+
 // trace: lodBaseAndLevelGeo returns the base name and LOD level for a mesh group
 // name. A name without an "_LOD<n>" suffix is level 0 (the base / LOD0 mesh).
 // Used by the FILEDIVER_FBX_ONLY_LOD single-level export path.
@@ -1052,9 +1083,7 @@ func LoadGLTF(ctx *extractor.Context, gpuR io.ReadSeeker, doc *gltf.Document, me
 				// game mesh of units whose name contains the word (ruin_debris_*,
 				// generic_debris_*) -- now only true destruction nodes are matched.
 				isDebris := isDestructionFormGeo(groupName)
-				isProxy := strings.Contains(groupName, "shadow") || strings.Contains(groupName, "cull") ||
-					strings.Contains(groupName, "collision") || strings.Contains(groupName, "_proxy") ||
-					strings.Contains(groupName, "destruction") || strings.Contains(groupName, "navigation")
+				isProxy := isProxyFormGeo(groupName)
 				if os.Getenv("FILEDIVER_FBX_ONLY_COLLISION") != "" {
 					// collision-only export: keep ONLY the physics-collision proxy
 					// (collision / *_collision, NOT rubble_collision), drop all else.
