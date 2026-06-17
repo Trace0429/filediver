@@ -1186,11 +1186,19 @@ func LoadGLTF(ctx *extractor.Context, gpuR io.ReadSeeker, doc *gltf.Document, me
 				continue
 			}
 
-			if strings.Contains(materialName, "collis") && !cfg.Model.IncludeLODS {
+			// trace: proxy (collision/shadow) material GROUPS must be dropped from the
+			// intact export even when IncludeLODS is set. The per-LOD FBX export uses
+			// --model-include-lods (IncludeLODS=true) to keep render LOD groups, but
+			// that previously also re-enabled the collis/shadow material groups, which
+			// leaked into UE as empty material slots (m_collision / m_shadow). Gate the
+			// skip on EXPORT MODE instead: in the collision-only export keep collision,
+			// otherwise always drop collis/shadow proxy materials.
+			onlyCollision := os.Getenv("FILEDIVER_FBX_ONLY_COLLISION") != ""
+			if strings.Contains(materialName, "collis") && !onlyCollision {
 				continue
 			}
 
-			if strings.Contains(materialName, "shadow") && !cfg.Model.IncludeLODS {
+			if strings.Contains(materialName, "shadow") {
 				continue
 			}
 
