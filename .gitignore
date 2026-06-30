@@ -11,3 +11,9 @@ filediver-cli.exe
 filediver-cli-*.exe
 /rsrc_windows_*.syso
 /bundles.dsaa
+
+# standalone tool binaries + working backups (HD2 tooling)
+/*.exe
+cmd/**/*.exe
+*.bak
+*.bak.*
