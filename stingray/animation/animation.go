@@ -183,11 +183,19 @@ func (b *BoneInitialState) IsAdditive() bool {
 }
 
 func (b BoneInitialState) MarshalJSON() ([]byte, error) {
-	scale := [3]float32{
-		b.cmpScl[0].Float32(),
-		b.cmpScl[1].Float32(),
-		b.cmpScl[2].Float32(),
+	// rawScale must be NaN-sanitized: additive bones carry NaN in cmpScl as their
+	// additive marker (see IsAdditive), and json.Marshal rejects NaN. Position()/
+	// Rotation()/Scale() already sanitize, but the Raw* passthrough did not, which
+	// made every additive animation fail to export. Replace NaN with 1.0 (identity scale).
+	rawScale := [3]float32{}
+	for i := range b.cmpScl {
+		if b.cmpScl[i].IsNaN() {
+			rawScale[i] = 1.0
+		} else {
+			rawScale[i] = b.cmpScl[i].Float32()
+		}
 	}
+	scale := rawScale
 	rot := b.Rotation()
 	return json.Marshal(jsonBoneInitialState{
 		Position:    b.Position(),
