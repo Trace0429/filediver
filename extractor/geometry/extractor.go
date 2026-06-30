@@ -1039,6 +1039,24 @@ func LoadGLTF(ctx *extractor.Context, gpuR io.ReadSeeker, doc *gltf.Document, me
 			return false
 		}
 
+		// trace: fbxOnlyLODActive marks the FILEDIVER_FBX_ONLY_LOD per-render-LOD export
+		// (NOT the debris-only / collision-only sub-modes, which keep their own
+		// selection). When active, the dedicated ONLY_LOD block below does ALL the
+		// group selection (it keeps only the group whose parsed level == onlyLOD and
+		// drops proxy/debris). The default !IncludeLODS drop above and the IncludeLODS
+		// gate on udimIndexAccessors below must therefore step aside for this mode,
+		// otherwise every g_*_LODN (N>=1) group is filtered out before/at geometry
+		// emission and the FBX comes out with no mesh nodes. N=0 was unaffected because
+		// the base group is not an _LOD group (isLOD=false), so it slipped both gates.
+		fbxOnlyLODActive := false
+		if os.Getenv("FILEDIVER_FBX_ONLY_LOD") != "" &&
+			os.Getenv("FILEDIVER_FBX_ONLY_DEBRIS") == "" &&
+			os.Getenv("FILEDIVER_FBX_ONLY_COLLISION") == "" {
+			if _, perr := strconv.Atoi(os.Getenv("FILEDIVER_FBX_ONLY_LOD")); perr == nil {
+				fbxOnlyLODActive = true
+			}
+		}
+
 		if isLOD(groupName, false, true) {
 			if !processedLODBones && (strings.Contains(groupName, "_LOD1") || strings.Contains(groupName, "_LOD0")) && !strings.Contains(groupName, "shadow") {
 				hasLOD0 = false
@@ -1057,7 +1075,7 @@ func LoadGLTF(ctx *extractor.Context, gpuR io.ReadSeeker, doc *gltf.Document, me
 				}
 				processedLODBones = true
 			}
-			if !cfg.Model.IncludeLODS && ((hasLOD0 && strings.Contains(groupName, "_LOD") && !strings.Contains(groupName, "_LOD0")) || (hasBaseModel && strings.Contains(groupName, "_LOD0")) || strings.Contains(groupName, "shadow")) {
+			if !cfg.Model.IncludeLODS && !fbxOnlyLODActive && ((hasLOD0 && strings.Contains(groupName, "_LOD") && !strings.Contains(groupName, "_LOD0")) || (hasBaseModel && strings.Contains(groupName, "_LOD0")) || strings.Contains(groupName, "shadow")) {
 				continue
 			}
 		}
@@ -1386,7 +1404,16 @@ func LoadGLTF(ctx *extractor.Context, gpuR io.ReadSeeker, doc *gltf.Document, me
 					}
 				}
 			}
-			includeLOD := (cfg.Model.IncludeLODS && (isLOD(groupName, true, hasBaseModel)))
+			// trace: in the FILEDIVER_FBX_ONLY_LOD per-LOD export, a render-LOD group
+			// (g_*_LODN, N>=1) that already passed the level==onlyLOD check above must be
+			// emitted exactly like a base mesh. The UDIM-separation branch above is
+			// skipped for _LOD groups, so without this udimIndexAccessors stays empty and
+			// the group produces no primitive -> the FBX has no mesh nodes for N>=1.
+			// Scope this to isLOD groups only: the base/LOD0 group (isLOD=false) is
+			// already handled by the existing !isLOD branch (incl. its UDIM split), so
+			// N=0 behavior is left untouched.
+			fbxOnlyLODEmit := fbxOnlyLODActive && isLOD(groupName, true, hasBaseModel)
+			includeLOD := (cfg.Model.IncludeLODS && (isLOD(groupName, true, hasBaseModel))) || fbxOnlyLODEmit
 			if (cfg.Model.JoinComponents || visiblityMaskLength == 0) && !isLOD(groupName, true, hasBaseModel) || includeLOD {
 				udimIndexAccessors[0] = *groupIndices
 			}

@@ -7,7 +7,9 @@ import (
 	"io"
 	"maps"
 	"math"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/qmuntal/gltf"
@@ -30,6 +32,19 @@ import (
 	"github.com/xypwn/filediver/stingray/unit/material"
 	"github.com/xypwn/filediver/util"
 )
+
+// getEnvDeg reads a degrees value from an env var; returns 0 if unset/unparseable.
+func getEnvDeg(name string) float32 {
+	s := os.Getenv(name)
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(s, 32)
+	if err != nil {
+		return 0
+	}
+	return float32(v)
+}
 
 func LoadBoneMap(ctx *extractor.Context, unitInfo *unit.Info) (*bones.Info, error) {
 	if unitInfo.BonesHash.Value == 0x0 {
@@ -62,6 +77,13 @@ func AddSkeleton(ctx *extractor.Context, doc *gltf.Document, unitInfo *unit.Info
 
 	var matrices [][4][4]float32 = make([][4][4]float32, len(unitInfo.JointTransformMatrices))
 	gltfConversionMatrix := mgl32.HomogRotate3DX(mgl32.DegToRad(-90.0)).Mul4(mgl32.HomogRotate3DZ(mgl32.DegToRad(0)))
+	// Optional extra rotation baked into the mesh/skeleton conversion, left-multiplied so it acts
+	// in the (post-conversion) glTF frame. Tunable via env (degrees), default 0 = no change.
+	//   FILEDIVER_FBX_EXTRA_X / _Y / _Z   e.g. EXTRA_Y=180 EXTRA_Z=180 (= X180 composite).
+	if ex, ey, ez := getEnvDeg("FILEDIVER_FBX_EXTRA_X"), getEnvDeg("FILEDIVER_FBX_EXTRA_Y"), getEnvDeg("FILEDIVER_FBX_EXTRA_Z"); ex != 0 || ey != 0 || ez != 0 {
+		extra := mgl32.HomogRotate3DZ(mgl32.DegToRad(ez)).Mul4(mgl32.HomogRotate3DY(mgl32.DegToRad(ey))).Mul4(mgl32.HomogRotate3DX(mgl32.DegToRad(ex)))
+		gltfConversionMatrix = extra.Mul4(gltfConversionMatrix)
+	}
 	for i := range matrices {
 		jtm := unitInfo.JointTransformMatrices[i]
 		bindMatrix := mgl32.Mat4FromRows(jtm[0], jtm[1], jtm[2], jtm[3]).Transpose()
@@ -284,6 +306,14 @@ func AddMaterials(ctx *extractor.Context, doc *gltf.Document, imgOpts *extr_mate
 		resID = ctx.OverrideMaterial(id, resID)
 		matR, err := ctx.Open(stingray.NewFileID(resID, stingray.Sum("material")), stingray.DataMain)
 		if err == stingray.ErrFileNotExist {
+			// Default: abort the whole unit (unchanged behavior). Only when
+			// FILEDIVER_SKIP_MISSING_MATERIAL=1 do we skip this one missing material
+			// slot and keep exporting the remaining materials + the geometry. This
+			// rescues units whose material was stripped from the readable bundles
+			// (the mesh is fine; the slot just falls back to a default material).
+			if os.Getenv("FILEDIVER_SKIP_MISSING_MATERIAL") == "1" {
+				continue
+			}
 			return nil, fmt.Errorf("referenced material resource %v doesn't exist", resID)
 		}
 		if err != nil {
